@@ -24,9 +24,9 @@ YOUR key — read from the system keychain, never from a file (see
 _get_elevenlabs_key) — with Kokoro as the automatic fallback: the voice
 degrades instead of going mute if the cloud fails.
 
-Sentences are synthesized one at a time and queued for playback, so the
-first sentence is audible while later ones are still rendering. Playback
-is cancellable mid-word: set the stop event and the speaker goes silent
+A renderer thread works one sentence ahead of the player, so the next
+sentence is ready by the time the current one ends. Playback is
+cancellable mid-word: set the stop event and the speaker goes silent
 within one audio block plus the device buffer (~0.15s).
 
 HARD-WON AUDIO LAW #1 — ONE long-lived OutputStream, reused for every
@@ -252,6 +252,13 @@ class Mouth:
     def __init__(self):
         from backtalk.ducking import Ducker
         self._q: queue.Queue = queue.Queue()
+        # One rendered sentence waits here while the current one plays,
+        # so a barge-in wastes at most one sentence of rendering.
+        self._rendered: queue.Queue = queue.Queue(maxsize=1)
+        # Every barge-in starts a new generation; audio rendered for an
+        # older one is thrown away instead of played.
+        self._generation = 0
+        self._rendering = threading.Event()
         self._stop = threading.Event()
         self._speaking = threading.Event()
         # The one persistent output stream (audio law #1).
@@ -259,6 +266,8 @@ class Mouth:
         self._out: sd.OutputStream | None = None
         self._out_rate: int | None = None
         self.ducker = Ducker()  # public: PTT ducks for the USER's voice too
+        self._renderer = threading.Thread(target=self._render_ahead, daemon=True)
+        self._renderer.start()
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
 
@@ -280,13 +289,16 @@ class Mouth:
             self._q.put(text)
 
     def shut_up(self):
-        """Barge-in: stop current playback and flush everything queued."""
+        """Barge-in: stop current playback and flush everything queued,
+        rendered audio included."""
+        self._generation += 1
         self._stop.set()
-        try:
-            while True:
-                self._q.get_nowait()
-        except queue.Empty:
-            pass
+        for waiting in (self._q, self._rendered):
+            try:
+                while True:
+                    waiting.get_nowait()
+            except queue.Empty:
+                pass
 
     def shutdown(self):
         """Exit path: stop playback and restore the music SYNCHRONOUSLY
@@ -298,28 +310,50 @@ class Mouth:
         """Block until the queue is drained and playback finished."""
         import time
         deadline = None if timeout is None else time.time() + timeout
-        while (not self._q.empty()) or self._speaking.is_set():
+        while not self._nothing_pending() or self._speaking.is_set():
             time.sleep(0.05)
             if deadline and time.time() > deadline:
                 return
 
-    def _run(self):
-        from backtalk import signals
+    def _nothing_pending(self) -> bool:
+        return (self._q.empty() and self._rendered.empty()
+                and not self._rendering.is_set())
+
+    def _render_ahead(self):
+        """Render each queued sentence while the one before it plays."""
         while True:
             sentence = self._q.get()
             if not sentence:
                 continue
+            generation = self._generation
+            self._rendering.set()
+            try:
+                audio = list(synth_stream(sentence))
+                if audio and generation == self._generation:
+                    self._rendered.put((generation, sentence, audio))
+            except Exception as error:
+                log(f"[mouth] synth error: {error}")
+            finally:
+                self._rendering.clear()
+
+    def _run(self):
+        from backtalk import signals
+        while True:
+            generation, sentence, audio = self._rendered.get()
+            if generation != self._generation:
+                continue              # rendered before a barge-in
             self._stop.clear()
             self._speaking.set()
             self.ducker.speech_start()
             signals.static_stop()     # thinking sound dies when speech starts
             signals.set_state("speaking")
+            log(f"[mouth] speaking: {sentence[:60]}")
             try:
-                self._play_stream(sentence)
-            except Exception as e:
-                log(f"[mouth] synth/play error: {e}")
+                self._play_rendered(audio)
+            except Exception as error:
+                log(f"[mouth] play error: {error}")
             finally:
-                if self._q.empty():
+                if self._nothing_pending():
                     self._speaking.clear()
                     self.ducker.speech_end()
                     signals.set_state("idle")
@@ -363,47 +397,26 @@ class Mouth:
         self._out = None
         self._out_rate = None
 
-    def _play_stream(self, sentence: str, block: int = 2205,
-                     prebuffer_s: float = 0.75):
-        """Stream-synthesize and play with the head-start buffer (audio
-        law #2). stop() reacts ~50ms. The sample rate comes from
-        whichever engine actually answered."""
+    def _play_rendered(self, audio: list, block: int = 2205):
+        """Play one fully rendered sentence. A whole sentence in hand is
+        more head start than audio law #2 asks for. stop() reacts within
+        one block. The rate comes from whichever engine answered."""
         from backtalk import signals
-        gen = synth_stream(sentence)
-        head: list = []
-        banked = 0
-        rate = None
-        for rate_, pcm in gen:
-            rate = rate_
-            head.append(pcm)
-            banked += len(pcm)
-            if banked >= int(rate * prebuffer_s):
-                break
-        if rate is None:
-            return
         try:
-            out = self._get_out(rate)
-
-            def _write(pcm):
-                for i in range(0, len(pcm), block):
+            for rate, pcm in audio:
+                out = self._get_out(rate)
+                for start in range(0, len(pcm), block):
                     if self._stop.is_set():
-                        return False
-                    out.write(pcm[i:i + block])
+                        self._cut()
+                        return
+                    out.write(pcm[start:start + block])
                     # Re-check after the blocking write: a barge-in
                     # landing mid-block must not let feed_waveform
                     # re-assert "speaking" over a fresh "listening".
                     if self._stop.is_set():
-                        return False
-                    signals.feed_waveform(pcm[i:i + block])
-                return True
-            for pcm in head:
-                if not _write(pcm):
-                    self._cut()
-                    return
-            for _, pcm in gen:
-                if not _write(pcm):
-                    self._cut()
-                    return
+                        self._cut()
+                        return
+                    signals.feed_waveform(pcm[start:start + block])
         except Exception:
             self._drop_out()
             raise
