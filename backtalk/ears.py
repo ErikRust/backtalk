@@ -16,7 +16,8 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """The ears — mic capture with VAD endpointing, transcribed in-process
-by faster-whisper. Local, free, no server, no API key.
+by faster-whisper. Local, free, no API key. If stt_url is set, speech
+goes to that whisper server first and the local model is the fallback.
 
 record_held() is the hold-to-talk capture (the button is the VAD).
 Ears.listen_once() is the legacy open-mic mode: blocks until one
@@ -25,8 +26,12 @@ an utterance opens after ~120ms of sustained speech, closes after
 `silence_ms` of trailing quiet. A `gate` callable can suppress
 listening (so the open mic ignores the speakers unless barge-in is on).
 """
+import io
+import json
 import re
 import threading
+import urllib.request
+import wave
 
 import numpy as np
 import sounddevice as sd
@@ -64,16 +69,38 @@ def warm():
     return _model
 
 
+def transcribe_on_server(pcm: np.ndarray) -> str | None:
+    """Send the clip to the whisper server at stt_url. Returns None when
+    the server does not answer in time, so the local model takes over."""
+    clip = io.BytesIO()
+    with wave.open(clip, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(RATE)
+        wav.writeframes(pcm.astype(np.int16).tobytes())
+    request = urllib.request.Request(CFG["stt_url"] + "?batch=0",
+                                     data=clip.getvalue(), method="POST")
+    try:
+        with urllib.request.urlopen(request,
+                                    timeout=CFG["stt_timeout_s"]) as reply:
+            return json.load(reply)["text"]
+    except (OSError, ValueError, KeyError) as error:
+        log(f"[ears] whisper server unavailable ({error}); using the local model")
+        return None
+
+
 def transcribe(pcm: np.ndarray) -> str:
     """int16 mono 16kHz -> text. Bracketed non-speech markers that
     whisper emits ([BLANK_AUDIO], [SIGHS], (coughs)...) are stripped;
     if nothing remains, it was silence."""
-    model = warm()
-    audio = pcm.astype(np.float32) / 32768.0
-    segments, _ = model.transcribe(audio, temperature=0.0, language="en"
-                                   if CFG["stt_model"].endswith(".en")
-                                   else None)
-    text = "".join(s.text for s in segments).strip()
+    text = transcribe_on_server(pcm) if CFG["stt_url"] else None
+    if text is None:
+        model = warm()
+        audio = pcm.astype(np.float32) / 32768.0
+        segments, _ = model.transcribe(audio, temperature=0.0, language="en"
+                                       if CFG["stt_model"].endswith(".en")
+                                       else None)
+        text = "".join(s.text for s in segments).strip()
     return _NONSPEECH.sub("", text).strip()
 
 

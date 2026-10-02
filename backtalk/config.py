@@ -119,6 +119,12 @@ DEFAULTS = {
     # "auto" uses CUDA when present, otherwise CPU. int8 keeps CPU fast.
     "stt_device": "auto",
     "stt_compute": "int8",
+    # Optional: send speech to a whisper server on another machine
+    # (e.g. a GPU desktop). The local model stays loaded and takes over
+    # whenever the server does not answer within stt_timeout_s seconds.
+    # Empty means local only.
+    "stt_url": "",
+    "stt_timeout_s": 5,
     # Optional premium voice: ElevenLabs on YOUR key. The key NEVER
     # goes in a file: it's read from the macOS Keychain (item
     # `backtalk-elevenlabs`) or Linux secret-tool, with the
