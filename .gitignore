@@ -10,3 +10,7 @@ uv.lock
 backtalk.egg-info/
 # your personal config, created at setup: never tracked, never touched by updates
 backtalk.json
+# Secrets never enter the repo; only a template such as .env.example is tracked.
+.env
+.env.*
+!.env.example
